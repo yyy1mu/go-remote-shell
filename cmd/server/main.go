@@ -1,4 +1,3 @@
-// File: cmd/server/main.go
 package main
 
 import (
@@ -9,167 +8,200 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// connectionPair 用于存储配对的 agent 和 ui 的 WebSocket 连接
-type connectionPair struct {
-	agent *websocket.Conn
-	ui    *websocket.Conn
+// agentSession 用于存储一个 Agent 和所有连接到它的 UI
+type agentSession struct {
+	agent        *websocket.Conn
+	uis          map[*websocket.Conn]bool
+	sync.RWMutex // 用于保护 uis 集合的读写
 }
 
-// ClientManager 是一个线程安全的结构，用于管理所有客户端连接
+// ClientManager 管理所有 agentSession
 type ClientManager struct {
-	clients map[string]*connectionPair
+	clients map[string]*agentSession
 	sync.Mutex
 }
 
-// NewClientManager 创建一个新的 ClientManager
 func NewClientManager() *ClientManager {
 	return &ClientManager{
-		clients: make(map[string]*connectionPair),
+		clients: make(map[string]*agentSession),
 	}
 }
 
-// upgrader 用于将 HTTP 连接升级为 WebSocket 连接
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
-		// 允许所有来源的连接，用于开发；生产环境中应更严格
 		return true
 	},
 }
 
-// handleConnections 是处理 WebSocket 连接请求的主要函数
 func (cm *ClientManager) handleConnections(w http.ResponseWriter, r *http.Request) {
-	// 从 URL query 中获取参数
 	query := r.URL.Query()
 	clientId := query.Get("clientId")
 	connType := query.Get("type")
 
 	if clientId == "" || connType == "" {
-		log.Println("连接被拒绝: clientId 和 type 为必填项。")
 		http.Error(w, "clientId and type are required", http.StatusBadRequest)
 		return
 	}
 
-	// 升级 HTTP 连接为 WebSocket
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("升级 WebSocket 失败: %v", err)
 		return
 	}
 
-	// --- 连接管理 ---
 	cm.Lock()
-
-	// 如果 clientId 不存在，则初始化
-	if _, ok := cm.clients[clientId]; !ok {
-		cm.clients[clientId] = &connectionPair{}
+	session, ok := cm.clients[clientId]
+	if !ok {
+		// 如果会话不存在，则创建一个新的
+		session = &agentSession{
+			uis: make(map[*websocket.Conn]bool),
+		}
+		cm.clients[clientId] = session
 	}
-	pair := cm.clients[clientId]
+	cm.Unlock()
 
 	if connType == "agent" {
 		log.Printf("Agent 已连接: %s", clientId)
-		if pair.agent != nil {
-			pair.agent.Close() // 关闭任何已存在的 agent 连接
+		// 如果已有 Agent，先断开旧的
+		if session.agent != nil {
+			session.agent.Close()
 		}
-		pair.agent = ws
+		session.agent = ws
+		// Agent 连接后，启动一个协程，负责将从 Agent 收到的消息广播给所有 UI
+		go cm.broadcastAgentToUIs(session)
+
 	} else if connType == "ui" {
 		log.Printf("UI 已连接: %s", clientId)
-		if pair.ui != nil {
-			pair.ui.Close() // 关闭任何已存在的 ui 连接
-		}
-		pair.ui = ws
+		cm.handleUIConnection(session, ws)
 	} else {
 		log.Printf("未知的连接类型: %s", connType)
-		cm.Unlock()
 		ws.Close()
-		return
-	}
-
-	// 检查是否配对成功，如果成功则启动双向转发
-	agentConn, uiConn := pair.agent, pair.ui
-	if agentConn != nil && uiConn != nil {
-		log.Printf("为 %s 配对成功。", clientId)
-
-		// 向 Agent 发送启动指令
-		log.Printf("向 Agent %s 发送 start_session 指令", clientId)
-		startMessage := []byte(`{"type":"start_session"}`)
-		if err := agentConn.WriteMessage(websocket.TextMessage, startMessage); err != nil {
-			log.Printf("向 Agent 发送启动指令失败: %v", err)
-			cm.Unlock()
-			return // 如果发送失败，则不启动转发
-		}
-
-		log.Printf("为 %s 开始转发数据。", clientId)
-		// 解锁后启动goroutine，避免死锁
-		cm.Unlock()
-		go forward(uiConn, agentConn, "UI -> Agent", clientId, cm)
-		go forward(agentConn, uiConn, "Agent -> UI", clientId, cm)
-	} else {
-		cm.Unlock()
 	}
 }
 
-// forward 函数在两个 WebSocket 连接之间转发讯息
-func forward(src, dest *websocket.Conn, direction string, clientId string, cm *ClientManager) {
-	defer func() {
-		log.Printf("转发停止 (%s) for %s", direction, clientId)
-		cm.Lock()
-		defer cm.Unlock()
+// handleUIConnection 处理新的 UI 连接
+func (cm *ClientManager) handleUIConnection(session *agentSession, uiConn *websocket.Conn) {
+	session.Lock()
+	// 检查 Agent 是否存在
+	if session.agent == nil {
+		log.Println("UI 连接失败：Agent 尚未连接。")
+		session.Unlock()
+		uiConn.WriteMessage(websocket.TextMessage, []byte("错误：Agent 尚未连接。"))
+		uiConn.Close()
+		return
+	}
 
-		pair, ok := cm.clients[clientId]
-		if !ok {
+	// 如果这是第一个连接的 UI，则向 Agent 发送启动指令
+	if len(session.uis) == 0 {
+		log.Printf("第一个 UI 已连接，向 Agent 发送 start_session 指令")
+		startMessage := []byte(`{"type":"start_session"}`)
+		if err := session.agent.WriteMessage(websocket.TextMessage, startMessage); err != nil {
+			log.Printf("向 Agent 发送启动指令失败: %v", err)
+			session.Unlock()
+			uiConn.Close()
 			return
 		}
+	}
 
-		if direction == "Agent -> UI" {
-			if pair.ui != nil {
-				pair.ui.WriteMessage(websocket.TextMessage, []byte("\r\n--- AGENT DISCONNECTED ---\r\n"))
-			}
-			pair.agent = nil
-		} else { // UI -> Agent
-			pair.ui = nil
+	// 将新 UI 添加到会话的 UI 集合中
+	session.uis[uiConn] = true
+	session.Unlock()
+
+	// 为这个 UI 启动一个独立的协程，负责将从它收到的消息转发给 Agent
+	cm.forwardUIToAgent(session, uiConn)
+}
+
+// broadcastAgentToUIs 从 Agent 读取消息并广播给所有 UI
+func (cm *ClientManager) broadcastAgentToUIs(session *agentSession) {
+	defer func() {
+		// Agent 断开，关闭所有 UI 连接并清理会话
+		log.Println("Agent 连接已断开，正在关闭所有 UI 连接...")
+		session.Lock()
+		if session.agent != nil {
+			session.agent.Close()
+			session.agent = nil
 		}
-
-		if pair.agent == nil && pair.ui == nil {
-			delete(cm.clients, clientId)
-			log.Printf("已为 %s 清理所有连接。", clientId)
+		for ui := range session.uis {
+			ui.Close()
 		}
-
-		src.Close()
+		cm.Lock()
+		delete(cm.clients, session.getClientId()) // 假设有方法获取clientId
+		cm.Unlock()
+		session.Unlock()
 	}()
 
 	for {
-		msgType, msg, err := src.ReadMessage()
+		msgType, msg, err := session.agent.ReadMessage()
 		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("读取错误 (%s): %v", direction, err)
+			log.Printf("从 Agent 读取消息失败: %v", err)
+			break
+		}
+
+		session.RLock()
+		// 遍历所有 UI，将消息发送给它们
+		for ui := range session.uis {
+			if err := ui.WriteMessage(msgType, msg); err != nil {
+				log.Printf("向 UI 写入消息失败: %v", err)
+				// 可选择在此处处理发送失败的 UI（例如，移除它）
+			}
+		}
+		session.RUnlock()
+	}
+}
+
+// forwardUIToAgent 从单个 UI 读取消息并转发给 Agent
+func (cm *ClientManager) forwardUIToAgent(session *agentSession, uiConn *websocket.Conn) {
+	defer func() {
+		// UI 断开，只需将自己从会话中移除
+		log.Println("一个 UI 连接已断开。")
+		session.Lock()
+		delete(session.uis, uiConn)
+		session.Unlock()
+		uiConn.Close()
+	}()
+
+	for {
+		// 检查 Agent 是否还在线
+		session.RLock()
+		agentExists := session.agent != nil
+		session.RUnlock()
+		if !agentExists {
+			break
+		}
+
+		msgType, msg, err := uiConn.ReadMessage()
+		if err != nil {
+			if !websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("UI 连接正常关闭。")
 			} else {
-				log.Printf("连接正常关闭 (%s)", direction)
+				log.Printf("从 UI 读取消息失败: %v", err)
 			}
 			break
 		}
 
-		if dest != nil {
-			if err = dest.WriteMessage(msgType, msg); err != nil {
-				log.Printf("写入错误 (%s): %v", direction, err)
-				break
-			}
+		// 将消息写入 Agent
+		if err := session.agent.WriteMessage(msgType, msg); err != nil {
+			log.Printf("向 Agent 写入消息失败: %v", err)
+			break
 		}
 	}
 }
 
+// 辅助方法，用于在日志中找到 clientId (实际生产中应有更好的方式)
+func (s *agentSession) getClientId() string {
+	if s.agent != nil {
+		return s.agent.RemoteAddr().String() // 仅为示例
+	}
+	return "unknown"
+}
+
 func main() {
 	clientManager := NewClientManager()
-
-	// 设置静态文件服务器，用于提供 web/ 目录下的文件
 	http.Handle("/", http.FileServer(http.Dir("./web")))
-
-	// 设置 WebSocket 处理函数
 	http.HandleFunc("/ws", clientManager.handleConnections)
-
 	port := "3000"
 	log.Printf("服务器正在监听 http://localhost:%s", port)
-	err := http.ListenAndServe(":"+port, nil)
-	if err != nil {
+	if err := http.ListenAndServe(":"+port, nil); err != nil {
 		log.Fatal("ListenAndServe: ", err)
 	}
 }
