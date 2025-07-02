@@ -1,3 +1,4 @@
+// File: cmd/server/main.go
 package main
 
 import (
@@ -54,8 +55,6 @@ func (cm *ClientManager) handleConnections(w http.ResponseWriter, r *http.Reques
 		log.Printf("升级 WebSocket 失败: %v", err)
 		return
 	}
-	// defer ws.Close() // defer a ws.Close() here will close the connection immediately after handleConnections returns.
-	// The connection should be kept open for the forwarders. Closing is handled by the forwarder's defer.
 
 	// --- 连接管理 ---
 	cm.Lock()
@@ -69,13 +68,13 @@ func (cm *ClientManager) handleConnections(w http.ResponseWriter, r *http.Reques
 	if connType == "agent" {
 		log.Printf("Agent 已连接: %s", clientId)
 		if pair.agent != nil {
-			pair.agent.Close() // Close any existing agent connection for this ID
+			pair.agent.Close() // 关闭任何已存在的 agent 连接
 		}
 		pair.agent = ws
 	} else if connType == "ui" {
 		log.Printf("UI 已连接: %s", clientId)
 		if pair.ui != nil {
-			pair.ui.Close() // Close any existing ui connection for this ID
+			pair.ui.Close() // 关闭任何已存在的 ui 连接
 		}
 		pair.ui = ws
 	} else {
@@ -88,24 +87,29 @@ func (cm *ClientManager) handleConnections(w http.ResponseWriter, r *http.Reques
 	// 检查是否配对成功，如果成功则启动双向转发
 	agentConn, uiConn := pair.agent, pair.ui
 	if agentConn != nil && uiConn != nil {
-		log.Printf("为 %s 配对成功。开始转发数据。", clientId)
-		// 启动两个 goroutine 分别处理双向的数据流
-		// We need to release the lock before starting the goroutines to avoid deadlock.
-		cm.Unlock()
-		go forward(uiConn, agentConn, "UI -> Agent", clientId, cm) // UI 到 Agent
-		go forward(agentConn, uiConn, "Agent -> UI", clientId, cm) // Agent 到 UI
-	} else {
-		cm.Unlock() // 释放锁
-	}
+		log.Printf("为 %s 配对成功。", clientId)
 
-	// The select{} block from original code is not needed here.
-	// The handleConnections function will return, but the established websocket connection
-	// and the forward goroutines will remain active.
+		// 向 Agent 发送启动指令
+		log.Printf("向 Agent %s 发送 start_session 指令", clientId)
+		startMessage := []byte(`{"type":"start_session"}`)
+		if err := agentConn.WriteMessage(websocket.TextMessage, startMessage); err != nil {
+			log.Printf("向 Agent 发送启动指令失败: %v", err)
+			cm.Unlock()
+			return // 如果发送失败，则不启动转发
+		}
+
+		log.Printf("为 %s 开始转发数据。", clientId)
+		// 解锁后启动goroutine，避免死锁
+		cm.Unlock()
+		go forward(uiConn, agentConn, "UI -> Agent", clientId, cm)
+		go forward(agentConn, uiConn, "Agent -> UI", clientId, cm)
+	} else {
+		cm.Unlock()
+	}
 }
 
 // forward 函数在两个 WebSocket 连接之间转发讯息
 func forward(src, dest *websocket.Conn, direction string, clientId string, cm *ClientManager) {
-	// 当此函数结束时（通常是来源连接断开），清理连接
 	defer func() {
 		log.Printf("转发停止 (%s) for %s", direction, clientId)
 		cm.Lock()
@@ -113,33 +117,27 @@ func forward(src, dest *websocket.Conn, direction string, clientId string, cm *C
 
 		pair, ok := cm.clients[clientId]
 		if !ok {
-			return // Pair might have been already cleaned up
+			return
 		}
 
-		// 根据方向，通知另一端连接已断开
 		if direction == "Agent -> UI" {
 			if pair.ui != nil {
 				pair.ui.WriteMessage(websocket.TextMessage, []byte("\r\n--- AGENT DISCONNECTED ---\r\n"))
 			}
 			pair.agent = nil
 		} else { // UI -> Agent
-			if pair.agent != nil {
-				// We could notify the agent, but it's often not necessary.
-			}
 			pair.ui = nil
 		}
 
-		// 如果两者都断开，可以从 map 中移除
 		if pair.agent == nil && pair.ui == nil {
 			delete(cm.clients, clientId)
 			log.Printf("已为 %s 清理所有连接。", clientId)
 		}
 
-		src.Close() // 确保来源连接被关闭
+		src.Close()
 	}()
 
 	for {
-		// 从来源读取讯息
 		msgType, msg, err := src.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
@@ -150,7 +148,6 @@ func forward(src, dest *websocket.Conn, direction string, clientId string, cm *C
 			break
 		}
 
-		// 将讯息写入目的地
 		if dest != nil {
 			if err = dest.WriteMessage(msgType, msg); err != nil {
 				log.Printf("写入错误 (%s): %v", direction, err)
@@ -163,10 +160,10 @@ func forward(src, dest *websocket.Conn, direction string, clientId string, cm *C
 func main() {
 	clientManager := NewClientManager()
 
-	// 1. **修改点**: 设置静态文件服务器，用于提供 web/ 目录下的文件
+	// 设置静态文件服务器，用于提供 web/ 目录下的文件
 	http.Handle("/", http.FileServer(http.Dir("./web")))
 
-	// 2. 设置 WebSocket 处理函数
+	// 设置 WebSocket 处理函数
 	http.HandleFunc("/ws", clientManager.handleConnections)
 
 	port := "3000"

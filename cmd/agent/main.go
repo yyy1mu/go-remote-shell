@@ -9,19 +9,21 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"os/signal"
-	"syscall"
+	"time"
 
 	"github.com/creack/pty"
 	"github.com/gorilla/websocket"
-	"golang.org/x/term"
 )
 
 // ResizeMessage 定义了用于调整 PTY 大小的消息结构
-// 通常由 WebSocket 服务器发送而来
 type ResizeMessage struct {
 	Cols uint16 `json:"cols"`
 	Rows uint16 `json:"rows"`
+}
+
+// ControlMessage 用于接收来自服务器的指令
+type ControlMessage struct {
+	Type string `json:"type"`
 }
 
 var (
@@ -29,77 +31,98 @@ var (
 	clientId   = flag.String("id", "golang-client-1", "Client ID for this agent")
 )
 
+// main 函数现在负责保持与服务器的连接，并等待指令
 func main() {
-	// 解析命令行参数
 	flag.Parse()
+	log.Printf("Agent启动，ID: %s, 准备连接到服务器: %s", *clientId, *serverAddr)
 
-	// 监听中断信号，用于程序退出时进行清理
-	interrupt := make(chan os.Signal, 1)
-	signal.Notify(interrupt, os.Interrupt, syscall.SIGTERM)
-
-	// 构建 WebSocket 连接 URL
-	// 包含了 type=agent 和 clientId 参数，用于向服务器表明身份
 	u := url.URL{Scheme: "ws", Host: *serverAddr, Path: "/ws", RawQuery: "type=agent&clientId=" + *clientId}
-	log.Printf("正在连接到 %s", u.String())
 
-	// 使用 gorilla/websocket 库建立连接
-	c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
-	if err != nil {
-		log.Fatal("连接失败:", err)
+	// 外部循环，用于处理断线重连
+	for {
+		log.Printf("正在连接到 %s", u.String())
+		c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+		if err != nil {
+			log.Println("连接失败，将在5秒后重试:", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		log.Println("连接成功，等待服务器指令...")
+
+		// 内部循环，处理来自服务器的消息
+		err = listenForCommands(c)
+
+		// 如果 listenForCommands 返回，说明连接已断开
+		log.Printf("与服务器的连接已断开: %v. 准备重连...", err)
+		c.Close() // 确保关闭旧的连接
 	}
-	defer c.Close()
+}
 
-	log.Println("连接成功!")
+// listenForCommands 监听来自 WebSocket 的指令
+func listenForCommands(c *websocket.Conn) error {
+	for {
+		_, message, err := c.ReadMessage()
+		if err != nil {
+			return err // 连接错误，返回到上层进行重连
+		}
 
+		var cmd ControlMessage
+		if err := json.Unmarshal(message, &cmd); err != nil {
+			log.Printf("收到无法解析的消息: %s", message)
+			continue
+		}
+
+		// 如果是启动会话的指令，则开始 PTY 会话
+		if cmd.Type == "start_session" {
+			log.Println("收到 'start_session' 指令，正在启动 PTY...")
+			// handlePtySession 是一个阻塞函数，它会处理整个 PTY 会话的生命周期
+			// 直到会话结束（例如，用户退出或连接断开）
+			handlePtySession(c)
+			log.Println("PTY 会话已结束。返回等待指令状态。")
+		}
+	}
+}
+
+// handlePtySession 负责创建和管理一个 PTY 会话的完整生命周期
+func handlePtySession(c *websocket.Conn) {
 	// --- PTY 和 Shell 设置 ---
 	cmd := exec.Command("bash", "-i")
 	cmd.Env = append(os.Environ(), "TERM=xterm")
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
-		log.Fatalf("启动 pty 失败: %v", err)
+		log.Printf("启动 pty 失败: %v", err)
+		return
 	}
 	defer ptmx.Close()
 
-	// --- 终端原始模式设置 ---
-	// MakeRaw will also handle restoring the state on exit.
-	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
-	if err != nil {
-		log.Fatalf("设置终端为原始模式失败: %v", err)
-	}
-	defer term.Restore(int(os.Stdin.Fd()), oldState)
-
-	// ---- **** 这是画龙点睛的修改 **** ----
-	// 在 bash 启动后，立即发送 stty echo 命令来确保回显是开启的
-	_, err = ptmx.Write([]byte("stty echo\n"))
-	if err != nil {
-		log.Fatalf("写入 stty echo 失败: %v", err)
-	}
-	// ---- **** 修改部分结束 **** ----
+	// 确保 stty echo 开启
+	ptmx.Write([]byte("stty echo\n"))
 
 	// --- 双向数据转发 ---
-	// PTY -> WebSocket
+	// 创建一个 channel 来通知会话结束
+	done := make(chan struct{})
+
+	// Goroutine: PTY -> WebSocket
 	go func() {
+		defer close(done) // 当这个 goroutine 结束时，关闭 done channel
 		wsWriter := &websocketWriter{conn: c}
-		// io.Copy is blocking, so it runs in a goroutine.
-		if _, err := io.Copy(wsWriter, ptmx); err != nil {
-			if err != io.EOF {
-				log.Printf("从 pty 读取数据时出错: %v", err)
-			}
+		if _, err := io.Copy(wsWriter, ptmx); err != nil && err != io.EOF {
+			log.Printf("从 pty 复制到 websocket 时出错: %v", err)
 		}
-		log.Println("PTY -> WebSocket 的转发协程已结束。")
+		log.Println("PTY -> WebSocket 转发协程已结束。")
 	}()
 
-	// WebSocket -> PTY
+	// Goroutine: WebSocket -> PTY
 	go func() {
+		// 当这个 goroutine 结束时，关闭 pty 来终止 bash 进程
 		defer ptmx.Close()
-		defer c.Close()
 		for {
 			mt, message, err := c.ReadMessage()
 			if err != nil {
+				// 如果读取出错（通常意味着连接已断开），则退出循环
 				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 					log.Printf("读取 WebSocket 消息时出错: %v", err)
-				} else {
-					log.Println("WebSocket 连接已关闭。")
 				}
 				break
 			}
@@ -107,7 +130,6 @@ func main() {
 			if mt == websocket.TextMessage || mt == websocket.BinaryMessage {
 				var resizeMessage ResizeMessage
 				if json.Unmarshal(message, &resizeMessage) == nil && resizeMessage.Cols > 0 {
-					log.Printf("收到窗口大小调整命令: %dx%d", resizeMessage.Cols, resizeMessage.Rows)
 					if err := pty.Setsize(ptmx, &pty.Winsize{Rows: resizeMessage.Rows, Cols: resizeMessage.Cols}); err != nil {
 						log.Printf("调整 pty 大小时出错: %v", err)
 					}
@@ -119,34 +141,25 @@ func main() {
 				}
 			}
 		}
-		log.Println("WebSocket -> PTY 的转发协程已结束。")
+		log.Println("WebSocket -> PTY 转发协程已结束。")
 	}()
 
-	// 监听本地终端窗口大小变化 (SIGWINCH)
-	sigwinch := make(chan os.Signal, 1)
-	signal.Notify(sigwinch, syscall.SIGWINCH)
-	go func() {
-		for range sigwinch {
-			if err := pty.InheritSize(os.Stdin, ptmx); err != nil {
-				log.Printf("继承窗口大小时出错: %v", err)
-			}
-		}
-	}()
-	sigwinch <- syscall.SIGWINCH // Initial resize.
-
-	// 等待 shell 进程结束或中断信号
+	// 等待 shell 进程自己退出，或者等待 PTY->WebSocket 的转发协程结束
+	// 任何一个结束都意味着会话应该终结
 	select {
-	case <-interrupt:
-		log.Println("收到中断信号，正在退出...")
-	case err := <-wait(cmd):
+	case <-done: // PTY -> WebSocket 的转发已停止 (通常因为 pty 关闭)
+	case err := <-wait(cmd): // Shell 进程自己退出了 (例如用户输入了 exit)
 		if err != nil {
 			log.Printf("Shell 进程已结束，错误: %v", err)
 		} else {
-			log.Println("Shell 进程已结束。")
+			log.Println("Shell 进程已正常结束。")
 		}
 	}
+
+	// 会话结束，函数返回
 }
 
+// wait 辅助函数，用于等待命令执行完成
 func wait(cmd *exec.Cmd) chan error {
 	ch := make(chan error, 1)
 	go func() {
@@ -161,6 +174,7 @@ type websocketWriter struct {
 	conn *websocket.Conn
 }
 
+// Write 将字节切片作为 WebSocket 二进制消息写入
 func (w *websocketWriter) Write(p []byte) (int, error) {
 	err := w.conn.WriteMessage(websocket.BinaryMessage, p)
 	if err != nil {
