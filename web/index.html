@@ -1,0 +1,65 @@
+<!doctype html>
+<html>
+<head>
+  <title>Web Terminal</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
+  <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+</head>
+<body style="margin: 0; background-color: #1e1e1e;">
+<div id="terminal" style="width: 100vw; height: 100vh;"></div>
+<script>
+  const term = new Terminal({
+    cursorBlink: true,
+    fontSize: 14,
+    fontFamily: 'Consolas, "Courier New", monospace',
+    theme: {
+      background: '#1e1e1e',
+      foreground: '#d4d4d4',
+    }
+  });
+  term.open(document.getElementById('terminal'));
+
+  const params = new URLSearchParams(window.location.search);
+  const clientId = params.get('id') || 'golang-client-1'; // 从URL获取ID，或使用默认值
+
+  if (!clientId) {
+    term.write('Error: No client ID specified in URL. Use ?id=your-client-id');
+  } else {
+    const socketUrl = `ws://${window.location.host}/ws?type=ui&clientId=${clientId}`;
+    const socket = new WebSocket(socketUrl);
+
+    socket.onopen = () => {
+      term.write('--- WebSocket Connection Established ---\r\n');
+      console.log('Socket opened');
+      // 注意：这里需要一个机制来处理窗口大小，暂时从简
+    };
+
+    socket.onmessage = (event) => {
+      // 服务端发来的可能是 Blob 或 String，统一处理
+      if (event.data instanceof Blob) {
+        event.data.text().then(text => term.write(text));
+      } else {
+        term.write(event.data);
+      }
+    };
+
+    socket.onerror = (error) => {
+      term.write(`\r\n--- WebSocket Error: ${error.message} ---\r\n`);
+      console.error('Socket error:', error);
+    };
+
+    socket.onclose = (event) => {
+      term.write(`\r\n--- WebSocket Connection Closed (Code: ${event.code}) ---\r\n`);
+      console.log('Socket closed:', event);
+    };
+
+    // 将 xterm.js 的用户输入发送到 WebSocket
+    term.onData((data) => {
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(data);
+      }
+    });
+  }
+</script>
+</body>
+</html>
