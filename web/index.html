@@ -1,65 +1,127 @@
 <!doctype html>
 <html>
 <head>
-  <title>Web Terminal</title>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
-  <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+  <title>Go Remote Shell</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" />
+  <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+  <style>
+    body { font-family: sans-serif; display: flex; flex-direction: column; height: 100vh; margin: 0; background-color: #f0f0f0; }
+    .controls { padding: 10px; background-color: #ddd; display: flex; gap: 10px; align-items: center; }
+    .controls input { padding: 5px; }
+    .controls button { padding: 5px 10px; }
+    #terminal-container { flex-grow: 1; padding: 10px; background-color: #000; }
+    #terminal { height: 100%; width: 100%; }
+  </style>
 </head>
-<body style="margin: 0; background-color: #1e1e1e;">
-<div id="terminal" style="width: 100vw; height: 100vh;"></div>
+<body>
+<div class="controls">
+  <label for="clientId">Client ID:</label>
+  <input type="text" id="clientId" value="golang-client-1">
+  <label for="username">Username:</label>
+  <input type="text" id="username" value="" placeholder="留空则为 agent 默认用户">
+  <button id="connectBtn">连接</button>
+  <button id="disconnectBtn" disabled>断开连接</button>
+</div>
+<div id="terminal-container">
+  <div id="terminal"></div>
+</div>
+
 <script>
-  const term = new Terminal({
-    cursorBlink: true,
-    fontSize: 14,
-    fontFamily: 'Consolas, "Courier New", monospace',
-    theme: {
-      background: '#1e1e1e',
-      foreground: '#d4d4d4',
-    }
-  });
+  const term = new Terminal({ cursorBlink: true, fontFamily: 'monospace', fontSize: 14 });
+  const fitAddon = new FitAddon.FitAddon();
+  term.loadAddon(fitAddon);
   term.open(document.getElementById('terminal'));
+  fitAddon.fit();
+  window.onresize = () => fitAddon.fit();
 
-  const params = new URLSearchParams(window.location.search);
-  const clientId = params.get('id') || 'golang-client-1'; // 从URL获取ID，或使用默认值
+  const clientIdInput = document.getElementById('clientId');
+  const usernameInput = document.getElementById('username');
+  const connectBtn = document.getElementById('connectBtn');
+  const disconnectBtn = document.getElementById('disconnectBtn');
 
-  if (!clientId) {
-    term.write('Error: No client ID specified in URL. Use ?id=your-client-id');
-  } else {
-    const socketUrl = `ws://${window.location.host}/ws?type=ui&clientId=${clientId}`;
-    const socket = new WebSocket(socketUrl);
+  let socket = null;
+  // 1. 声明一个变量来持有 onData 监听器的 disposable 对象
+  let onDataDisposable = null;
+
+  function connect() {
+    if (socket) {
+      socket.close();
+    }
+
+    const clientId = clientIdInput.value.trim();
+    const username = usernameInput.value.trim();
+    if (!clientId) {
+      alert('Client ID 不能为空');
+      return;
+    }
+
+    term.reset();
+    term.writeln('正在连接...');
+
+    const protocol = (window.location.protocol === 'https:') ? 'wss://' : 'ws://';
+    let wsUrl = `${protocol}${window.location.host}/ws?type=ui&clientId=${encodeURIComponent(clientId)}`;
+    if (username) {
+      wsUrl += `&user=${encodeURIComponent(username)}`;
+    }
+
+    socket = new WebSocket(wsUrl);
 
     socket.onopen = () => {
-      term.write('--- WebSocket Connection Established ---\r\n');
-      console.log('Socket opened');
-      // 注意：这里需要一个机制来处理窗口大小，暂时从简
-    };
-
-    socket.onmessage = (event) => {
-      // 服务端发来的可能是 Blob 或 String，统一处理
-      if (event.data instanceof Blob) {
-        event.data.text().then(text => term.write(text));
-      } else {
-        term.write(event.data);
-      }
-    };
-
-    socket.onerror = (error) => {
-      term.write(`\r\n--- WebSocket Error: ${error.message} ---\r\n`);
-      console.error('Socket error:', error);
+      term.writeln(`\x1b[32m连接成功 (Client ID: ${clientId}, User: ${username || 'default'})\x1b[0m`);
+      fitAddon.fit();
+      sendResize();
+      connectBtn.disabled = true;
+      disconnectBtn.disabled = false;
     };
 
     socket.onclose = (event) => {
-      term.write(`\r\n--- WebSocket Connection Closed (Code: ${event.code}) ---\r\n`);
-      console.log('Socket closed:', event);
+      term.writeln(`\x1b[31m\r\n连接已断开。 Code: ${event.code}\x1b[0m`);
+      socket = null;
+      connectBtn.disabled = false;
+      disconnectBtn.disabled = true;
     };
 
-    // 将 xterm.js 的用户输入发送到 WebSocket
-    term.onData((data) => {
-      if (socket.readyState === WebSocket.OPEN) {
+    socket.onmessage = async (event) => {
+      if (event.data instanceof Blob) {
+        const data = new Uint8Array(await event.data.arrayBuffer());
+        term.write(data);
+      } else if (typeof event.data === 'string') {
+        term.writeln('\r\n' + event.data);
+      } else {
+        console.warn('收到未知类型的 WebSocket 消息:', event.data);
+      }
+    };
+
+    // 2. 在添加新的 onData 监听器之前，先销毁旧的（如果存在）
+    if (onDataDisposable) {
+      onDataDisposable.dispose();
+    }
+
+    // 3. 将新的 disposable 对象保存起来，并只在 socket 真正打开时发送数据
+    onDataDisposable = term.onData((data) => {
+      if (socket && socket.readyState === WebSocket.OPEN) {
         socket.send(data);
       }
     });
   }
+
+  function disconnect() {
+    if (socket) {
+      socket.close();
+    }
+  }
+
+  function sendResize() {
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      const resizeMsg = { cols: term.cols, rows: term.rows };
+      socket.send(JSON.stringify(resizeMsg));
+    }
+  }
+
+  term.onResize(sendResize);
+  connectBtn.addEventListener('click', connect);
+  disconnectBtn.addEventListener('click', disconnect);
 </script>
 </body>
 </html>
