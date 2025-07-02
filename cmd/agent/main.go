@@ -17,12 +17,12 @@ import (
 
 	"github.com/creack/pty"
 	"github.com/gorilla/websocket"
-	"go-remote-shell/internal/protocol" // 引入我们自己的协议包
+	"go-remote-shell/internal/protocol"
 )
 
-// SessionManager 管理所有本地 PTY 会话
+// SessionManager 保持不变
 type SessionManager struct {
-	sessions map[string]chan protocol.Message // key: sessionId, value: input channel
+	sessions map[string]chan protocol.Message
 	sync.RWMutex
 }
 
@@ -43,7 +43,7 @@ func (sm *SessionManager) Remove(id string) {
 	sm.Lock()
 	defer sm.Unlock()
 	if ch, ok := sm.sessions[id]; ok {
-		close(ch)
+		close(ch) // 关闭 channel 会触发 pty 会话的清理
 		delete(sm.sessions, id)
 	}
 }
@@ -75,22 +75,19 @@ func main() {
 	}
 }
 
-// runCommandDispatcher 是 Agent 的主循环，负责接收和分发指令
+// runCommandDispatcher 增加对 close_session 的处理
 func runCommandDispatcher(c *websocket.Conn) {
 	sm := &SessionManager{sessions: make(map[string]chan protocol.Message)}
 	writerChan := make(chan protocol.Message)
 
-	// 启动一个唯一的写入器，避免并发写入 websocket
 	go messageWriter(c, writerChan)
 
 	for {
 		_, msgBytes, err := c.ReadMessage()
 		if err != nil {
-			// 关闭所有会话并退出
 			sm.Lock()
-			for id, ch := range sm.sessions {
-				close(ch)
-				delete(sm.sessions, id)
+			for id := range sm.sessions {
+				sm.Remove(id)
 			}
 			sm.Unlock()
 			close(writerChan)
@@ -113,27 +110,27 @@ func runCommandDispatcher(c *websocket.Conn) {
 
 		case "data", "resize":
 			if ch, ok := sm.Get(msg.SessionID); ok {
-				ch <- msg // 将数据或resize指令发送到对应的 session channel
+				ch <- msg
 			}
 
-		case "close_session": // 服务器可以主动要求关闭会话
+		// NEW: 处理关闭会话指令
+		case "close_session":
+			log.Printf("收到关闭会话指令: SessionID=%s", msg.SessionID)
 			sm.Remove(msg.SessionID)
 		}
 	}
 }
 
-// messageWriter 将消息写入 websocket
+// messageWriter 和 handlePtySession 保持不变
 func messageWriter(c *websocket.Conn, ch chan protocol.Message) {
 	for msg := range ch {
 		msgBytes, _ := json.Marshal(msg)
 		if err := c.WriteMessage(websocket.TextMessage, msgBytes); err != nil {
-			log.Printf("写入 WebSocket 失败: %v", err)
 			break
 		}
 	}
 }
 
-// handlePtySession 现在为一个独立的会话工作
 func handlePtySession(sessionID, username string, inputChan chan protocol.Message, writerChan chan protocol.Message, onExit func()) {
 	defer func() {
 		log.Printf("PTY 会话 '%s' 已结束。", sessionID)
@@ -145,7 +142,6 @@ func handlePtySession(sessionID, username string, inputChan chan protocol.Messag
 
 	cmd := exec.Command("bash", "-i")
 	if username != "" {
-		// ... 用户切换逻辑和环境变量设置 (和之前一样) ...
 		u, err := user.Lookup(username)
 		if err != nil {
 			log.Printf("查找用户 '%s' 失败: %v", username, err)
@@ -164,7 +160,6 @@ func handlePtySession(sessionID, username string, inputChan chan protocol.Messag
 	}
 	defer ptmx.Close()
 
-	// PTY -> Server
 	go func() {
 		buffer := make([]byte, 4096)
 		for {
@@ -178,7 +173,6 @@ func handlePtySession(sessionID, username string, inputChan chan protocol.Messag
 		}
 	}()
 
-	// Server -> PTY
 	go func() {
 		for msg := range inputChan {
 			switch msg.Type {
@@ -191,7 +185,7 @@ func handlePtySession(sessionID, username string, inputChan chan protocol.Messag
 				pty.Setsize(ptmx, &pty.Winsize{Rows: msg.Rows, Cols: msg.Cols})
 			}
 		}
-		cancel() // input channel 关闭，意味着会话结束
+		cancel()
 	}()
 
 	<-ctx.Done()
