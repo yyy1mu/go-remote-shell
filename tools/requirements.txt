@@ -1,0 +1,4 @@
+# 用于剥离 ANSI 转义码，将终端输出转换为纯文本
+strip-ansi
+requests
+pyte==0.8.1
