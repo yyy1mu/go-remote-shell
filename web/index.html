@@ -1,127 +1,245 @@
 <!doctype html>
 <html>
 <head>
-  <title>Go Remote Shell</title>
+  <title>Go Remote Shell (FIDO2/WebAuthn)</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" />
   <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
   <style>
     body { font-family: sans-serif; display: flex; flex-direction: column; height: 100vh; margin: 0; background-color: #f0f0f0; }
-    .controls { padding: 10px; background-color: #ddd; display: flex; gap: 10px; align-items: center; }
-    .controls input { padding: 5px; }
-    .controls button { padding: 5px 10px; }
-    #terminal-container { flex-grow: 1; padding: 10px; background-color: #000; }
+    .controls { padding: 10px; background-color: #ddd; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; border-bottom: 1px solid #ccc; }
+    .controls input { padding: 8px; border: 1px solid #ccc; border-radius: 4px; }
+    .controls button { padding: 8px 15px; border: none; border-radius: 4px; cursor: pointer; transition: background-color 0.2s; }
+    .controls button:hover { opacity: 0.9; }
+    #registerBtn { background-color: #28a745; color: white; }
+    #loginBtn { background-color: #007bff; color: white; }
+    #status { padding: 10px; background-color: #e9ecef; color: #495057; font-family: monospace; }
+    #terminal-container { flex-grow: 1; padding: 10px; background-color: #000; display: none; /* 默认隐藏 */ }
     #terminal { height: 100%; width: 100%; }
   </style>
 </head>
 <body>
-<div class="controls">
+
+<div id="auth-controls" class="controls">
   <label for="clientId">Client ID:</label>
   <input type="text" id="clientId" value="golang-client-1">
   <label for="username">Username:</label>
-  <input type="text" id="username" value="" placeholder="留空则为 agent 默认用户">
-  <button id="connectBtn">连接</button>
-  <button id="disconnectBtn" disabled>断开连接</button>
+  <input type="text" id="username" value="root" placeholder="例如: root, devuser">
+  <button id="registerBtn">注册安全密钥</button>
+  <button id="loginBtn">使用安全密钥登录</button>
 </div>
+
+<div id="status">状态: 未连接。请输入 Client ID 和 Username 后进行操作。</div>
+
 <div id="terminal-container">
   <div id="terminal"></div>
 </div>
 
 <script>
-  const term = new Terminal({ cursorBlink: true, fontFamily: 'monospace', fontSize: 14 });
+  // --- 初始化 xterm.js ---
+  const term = new Terminal({ cursorBlink: true, fontFamily: 'monospace', fontSize: 14, convertEol: true });
   const fitAddon = new FitAddon.FitAddon();
   term.loadAddon(fitAddon);
   term.open(document.getElementById('terminal'));
-  fitAddon.fit();
   window.onresize = () => fitAddon.fit();
 
+  // --- 获取 DOM 元素 ---
   const clientIdInput = document.getElementById('clientId');
   const usernameInput = document.getElementById('username');
-  const connectBtn = document.getElementById('connectBtn');
-  const disconnectBtn = document.getElementById('disconnectBtn');
+  const registerBtn = document.getElementById('registerBtn');
+  const loginBtn = document.getElementById('loginBtn');
+  const statusDiv = document.getElementById('status');
+  const authControlsDiv = document.getElementById('auth-controls');
+  const terminalContainerDiv = document.getElementById('terminal-container');
 
   let socket = null;
-  // 1. 声明一个变量来持有 onData 监听器的 disposable 对象
-  let onDataDisposable = null;
 
+  // --- WebAuthn 辅助函数 ---
+  function bufferToBase64URL(buffer) {
+    return btoa(String.fromCharCode.apply(null, new Uint8Array(buffer)))
+            .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+  }
+  function base64URLToBuffer(base64url) {
+    const str = atob(base64url.replace(/-/g, '+').replace(/_/g, '/'));
+    const buffer = new Uint8Array(str.length);
+    for (let i = 0; i < str.length; i++) {
+      buffer[i] = str.charCodeAt(i);
+    }
+    return buffer.buffer;
+  }
+
+  // --- WebSocket 连接和消息处理 ---
   function connect() {
-    if (socket) {
-      socket.close();
-    }
-
-    const clientId = clientIdInput.value.trim();
-    const username = usernameInput.value.trim();
-    if (!clientId) {
-      alert('Client ID 不能为空');
-      return;
-    }
-
-    term.reset();
-    term.writeln('正在连接...');
-
-    const protocol = (window.location.protocol === 'https:') ? 'wss://' : 'ws://';
-    let wsUrl = `${protocol}${window.location.host}/ws?type=ui&clientId=${encodeURIComponent(clientId)}`;
-    if (username) {
-      wsUrl += `&user=${encodeURIComponent(username)}`;
-    }
-
-    socket = new WebSocket(wsUrl);
-
-    socket.onopen = () => {
-      term.writeln(`\x1b[32m连接成功 (Client ID: ${clientId}, User: ${username || 'default'})\x1b[0m`);
-      fitAddon.fit();
-      sendResize();
-      connectBtn.disabled = true;
-      disconnectBtn.disabled = false;
-    };
-
-    socket.onclose = (event) => {
-      term.writeln(`\x1b[31m\r\n连接已断开。 Code: ${event.code}\x1b[0m`);
-      socket = null;
-      connectBtn.disabled = false;
-      disconnectBtn.disabled = true;
-    };
-
-    socket.onmessage = async (event) => {
-      if (event.data instanceof Blob) {
-        const data = new Uint8Array(await event.data.arrayBuffer());
-        term.write(data);
-      } else if (typeof event.data === 'string') {
-        term.writeln('\r\n' + event.data);
-      } else {
-        console.warn('收到未知类型的 WebSocket 消息:', event.data);
-      }
-    };
-
-    // 2. 在添加新的 onData 监听器之前，先销毁旧的（如果存在）
-    if (onDataDisposable) {
-      onDataDisposable.dispose();
-    }
-
-    // 3. 将新的 disposable 对象保存起来，并只在 socket 真正打开时发送数据
-    onDataDisposable = term.onData((data) => {
+    return new Promise((resolve, reject) => {
       if (socket && socket.readyState === WebSocket.OPEN) {
-        socket.send(data);
+        return resolve(socket);
       }
+
+      const clientId = clientIdInput.value.trim();
+      if (!clientId) {
+        alert('Client ID 不能为空');
+        return reject(new Error('Client ID is empty'));
+      }
+
+      const protocol = (window.location.protocol === 'https:') ? 'wss://' : 'ws://';
+      const wsUrl = `${protocol}${window.location.host}/ws?type=ui&clientId=${encodeURIComponent(clientId)}`;
+
+      updateStatus(`正在连接到 Agent: ${clientId}...`);
+      socket = new WebSocket(wsUrl);
+
+      socket.onopen = () => {
+        updateStatus(`已连接到 Agent: ${clientId}，等待操作...`);
+        resolve(socket);
+      };
+      socket.onerror = (err) => { updateStatus(`连接错误`); reject(err); };
+      socket.onclose = () => {
+        updateStatus('连接已断开。');
+        authControlsDiv.style.display = 'flex';
+        terminalContainerDiv.style.display = 'none';
+      };
+      socket.onmessage = handleSocketMessage;
     });
   }
 
-  function disconnect() {
-    if (socket) {
-      socket.close();
+  async function handleSocketMessage(event) {
+    const msg = JSON.parse(event.data);
+
+    switch(msg.type) {
+      case 'webauthn_register_options':
+        updateStatus('收到注册选项，请触摸您的安全密钥或使用生物识别...');
+        try {
+          const options = JSON.parse(msg.payload);
+          const pubKeyOpts = options.publicKey;
+          pubKeyOpts.challenge = base64URLToBuffer(pubKeyOpts.challenge);
+          pubKeyOpts.user.id = base64URLToBuffer(pubKeyOpts.user.id);
+
+          const credential = await navigator.credentials.create({ publicKey: pubKeyOpts });
+
+          const credentialForServer = {
+            id: credential.id,
+            rawId: bufferToBase64URL(credential.rawId),
+            type: credential.type,
+            response: {
+              clientDataJSON: bufferToBase64URL(credential.response.clientDataJSON),
+              attestationObject: bufferToBase64URL(credential.response.attestationObject),
+            },
+          };
+
+          sendMessage({ type: 'webauthn_finish_register', user: msg.user, payload: JSON.stringify(credentialForServer) });
+        } catch (err) { updateStatus(`注册失败: ${err}`); }
+        break;
+
+      case 'webauthn_login_options':
+        updateStatus('收到登录选项，请触摸您的安全密钥或使用生物识别...');
+        try {
+          const options = JSON.parse(msg.payload);
+          const pubKeyOpts = options.publicKey;
+          pubKeyOpts.challenge = base64URLToBuffer(pubKeyOpts.challenge);
+          if (pubKeyOpts.allowCredentials) {
+            pubKeyOpts.allowCredentials.forEach(cred => { cred.id = base64URLToBuffer(cred.id); });
+          }
+
+          const assertion = await navigator.credentials.get({ publicKey: pubKeyOpts });
+
+          const assertionForServer = {
+            id: assertion.id,
+            rawId: bufferToBase64URL(assertion.rawId),
+            type: assertion.type,
+            response: {
+              authenticatorData: bufferToBase64URL(assertion.response.authenticatorData),
+              clientDataJSON: bufferToBase64URL(assertion.response.clientDataJSON),
+              signature: bufferToBase64URL(assertion.response.signature),
+              userHandle: assertion.response.userHandle ? bufferToBase64URL(assertion.response.userHandle) : null,
+            },
+          };
+
+          sendMessage({ type: 'webauthn_finish_login', user: msg.user, payload: JSON.stringify(assertionForServer) });
+        } catch (err) { updateStatus(`登录失败: ${err}`); }
+        break;
+
+      case 'register_success':
+        updateStatus(`用户 '${msg.user}' 密钥注册成功！现在可以登录了。`);
+        break;
+
+      case 'login_success':
+        updateStatus('登录成功！正在启动远程终端...');
+        // ==================== 关键修改 1 ====================
+        // 登录成功后，将服务器分配的 SessionID 保存到 socket 对象上，以备后用
+        socket.sessionId = msg.sessionId;
+        // ======================================================
+        showTerminal();
+        term.focus();
+        break;
+
+      case 'data':
+        // Agent 发送的消息已经是封装好的 protocol.Message，我们需要解码 payload
+        const data = atob(msg.payload); // Base64 解码
+        const bytes = new Uint8Array(data.length);
+        for(let i = 0; i < data.length; i++) {
+          bytes[i] = data.charCodeAt(i);
+        }
+        term.write(bytes); // 写入二进制数据
+        break;
+
+      case 'error':
+        updateStatus(`收到错误: ${msg.error}`);
+        break;
     }
   }
 
-  function sendResize() {
+  function sendMessage(msg) {
     if (socket && socket.readyState === WebSocket.OPEN) {
-      const resizeMsg = { cols: term.cols, rows: term.rows };
-      socket.send(JSON.stringify(resizeMsg));
+      socket.send(JSON.stringify(msg));
+    } else {
+      updateStatus('无法发送消息：连接未建立或已断开。');
     }
   }
 
-  term.onResize(sendResize);
-  connectBtn.addEventListener('click', connect);
-  disconnectBtn.addEventListener('click', disconnect);
+  // --- UI 事件处理 ---
+  registerBtn.addEventListener('click', async () => {
+    const username = usernameInput.value.trim();
+    if (!username) { alert('注册需要提供 Username'); return; }
+
+    try {
+      await connect();
+      sendMessage({ type: 'webauthn_begin_register', user: username });
+    } catch (err) { console.error("连接失败", err); }
+  });
+
+  loginBtn.addEventListener('click', async () => {
+    const username = usernameInput.value.trim();
+    if (!username) { alert('登录需要提供 Username'); return; }
+
+    try {
+      await connect();
+      sendMessage({ type: 'webauthn_begin_login', user: username });
+    } catch (err) { console.error("连接失败", err); }
+  });
+
+  // ==================== 关键修改 2 ====================
+  // 在发送终端数据时，附上我们保存的 sessionId
+  term.onData((data) => {
+    if(socket && socket.readyState === WebSocket.OPEN && socket.sessionId) {
+      sendMessage({ type: 'data', sessionId: socket.sessionId, payload: btoa(data) });
+    }
+  });
+  term.onResize(({ cols, rows }) => {
+    if(socket && socket.readyState === WebSocket.OPEN && socket.sessionId) {
+      sendMessage({ type: 'resize', sessionId: socket.sessionId, cols, rows });
+    }
+  });
+  // ======================================================
+
+  function showTerminal() {
+    authControlsDiv.style.display = 'none';
+    terminalContainerDiv.style.display = 'flex';
+    fitAddon.fit();
+  }
+
+  function updateStatus(text) {
+    console.log(text);
+    statusDiv.textContent = text;
+  }
 </script>
 </body>
 </html>
