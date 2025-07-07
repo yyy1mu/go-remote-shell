@@ -77,7 +77,7 @@ class LogParser:
         if self._clean_transcript is not None:
             return self._clean_transcript
 
-        screen = pyte.Screen(80, 24, history=10000)
+        screen = pyte.HistoryScreen(80, 24, history=10000)
         stream = pyte.ByteStream(screen)
 
         # self.events 现在只包含解码后的原始终端数据
